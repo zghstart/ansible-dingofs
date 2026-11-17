@@ -1,7 +1,7 @@
 # Rendered by ansible - do not edit on the host.
 #
-# Four top-level services, each with config (and deploy). Only node_exporter's
-# deploy list is read: the central services take its first entry as their host.
+# Four top-level services with explicit deploy lists. The paired P0 CLI
+# deploys node_exporter to all listed hosts and honors central placement.
 # See roles/dingo_monitor/defaults/main.yml.
 
 # monitor_sync carries the dashboards and pushes them to grafana. data_dir is
@@ -11,6 +11,8 @@ monitor_sync:
   config:
     container_image: {{ dingo_monitor_sync_image }}
     data_dir: {{ dingo_monitor_data_dir }}
+  deploy:
+    - host: {{ dingo_monitor_central_host }}
 
 node_exporter:
   config:

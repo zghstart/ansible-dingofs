@@ -1,0 +1,181 @@
+---
+# Explicit asset overlay for new/existing stacks. Source is the reviewed
+# DingoFS scripts/monitor directory, not another independently maintained copy.
+- name: Stage reviewed monitor assets on the central host
+  become: true
+  become_user: "{{ dingofs_user }}"
+  delegate_to: "{{ dingo_monitor_central_host }}"
+  block:
+    - name: Check for an existing operator inventory
+      stat:
+        path: "{{ dingo_monitor_data_dir }}/prometheus/expected-targets.json"
+      register: _monitor_expected_file
+
+    - name: Read the existing inventory when no replacement was specified
+      slurp:
+        src: "{{ dingo_monitor_data_dir }}/prometheus/expected-targets.json"
+      register: _monitor_existing_inventory
+      when:
+        - dingo_monitor_expected_targets is none
+        - _monitor_expected_file.stat.exists
+
+    - name: Select explicit or preserved expected inventory
+      set_fact:
+        _monitor_expected_inventory: >-
+          {{ dingo_monitor_expected_targets if dingo_monitor_expected_targets is not none
+             else ((_monitor_existing_inventory.content | b64decode | from_json)
+                   if _monitor_expected_file.stat.exists else []) }}
+
+    - name: Create a temporary validation directory
+      tempfile:
+        state: directory
+        prefix: dingofs-monitor-p0-
+      register: _monitor_stage
+      changed_when: false
+
+    - name: Create staged configuration directories
+      file:
+        path: "{{ _monitor_stage.path }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: [prometheus, prometheus/rules, grafana, grafana/provisioning, grafana/provisioning/dashboards, grafana/provisioning/datasources]
+      changed_when: false
+
+    - name: Stage the source Prometheus configuration
+      copy:
+        content: "{{ lookup('file', dingo_monitor_observability_assets_dir ~ '/prometheus/prometheus.yml') | replace('localhost:9090', 'localhost:' ~ dingo_monitor_prometheus_port) | replace('127.0.0.1:19100', '127.0.0.1:' ~ dingo_monitor_discovery_metrics_port) }}\n"
+        dest: "{{ _monitor_stage.path }}/prometheus/prometheus.yml"
+        mode: "0644"
+      changed_when: false
+
+    - name: Stage the reviewed collection rules
+      copy:
+        src: "{{ dingo_monitor_observability_assets_dir }}/prometheus/rules/"
+        dest: "{{ _monitor_stage.path }}/prometheus/rules/"
+        mode: "0644"
+      changed_when: false
+
+    - name: Stage discovery code and independent inventory for validation
+      copy:
+        src: "{{ dingo_monitor_observability_assets_dir }}/target_json.py"
+        dest: "{{ _monitor_stage.path }}/target_json.py"
+        mode: "0644"
+      changed_when: false
+
+    - name: Stage the independent inventory
+      copy:
+        content: "{{ _monitor_expected_inventory | to_nice_json }}\n"
+        dest: "{{ _monitor_stage.path }}/expected-targets.json"
+        mode: "0644"
+      changed_when: false
+
+    - name: Validate inventory before changing live configuration
+      command:
+        argv:
+          - python3
+          - -c
+          - "import json,runpy,sys; module=runpy.run_path(sys.argv[1]); module['validate_groups'](json.load(open(sys.argv[2])),sys.argv[3],True)"
+          - "{{ _monitor_stage.path }}/target_json.py"
+          - "{{ _monitor_stage.path }}/expected-targets.json"
+          - "{{ dingofs_cluster_name }}"
+      changed_when: false
+
+    - name: Validate Prometheus before changing live configuration
+      command:
+        argv:
+          - "{{ container_engine | default('podman') }}"
+          - run
+          - --rm
+          - --entrypoint
+          - /bin/promtool
+          - --volume
+          - "{{ _monitor_stage.path }}/prometheus:/etc/prometheus:ro,z"
+          - --volume
+          - "{{ dingo_monitor_data_dir }}/prometheus/data:/prometheus:ro,z"
+          - "{{ dingo_monitor_prometheus_image }}"
+          - check
+          - config
+          - /etc/prometheus/prometheus.yml
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Install reviewed Prometheus configuration
+      copy:
+        src: "{{ _monitor_stage.path }}/prometheus/"
+        dest: "{{ dingo_monitor_data_dir }}/prometheus/"
+        remote_src: true
+        mode: preserve
+      register: _monitor_prom_assets
+
+    - name: Install discovery and Grafana assets from the same source
+      copy:
+        src: "{{ dingo_monitor_observability_assets_dir }}/{{ item }}"
+        dest: "{{ dingo_monitor_data_dir }}/{{ item }}"
+        mode: preserve
+      loop: [target_json.py, grafana/provisioning/dashboards/]
+      register: _monitor_other_assets
+
+    - name: Install cluster-scoped discovery configuration
+      template:
+        src: target.ini.j2
+        dest: "{{ dingo_monitor_data_dir }}/target.ini"
+        mode: "0644"
+      register: _monitor_discovery_config
+
+    - name: Install independent expected inventory
+      copy:
+        content: "{{ _monitor_expected_inventory | to_nice_json }}\n"
+        dest: "{{ dingo_monitor_data_dir }}/prometheus/expected-targets.json"
+        mode: "0644"
+      register: _monitor_inventory
+
+    - name: Install the discovery collector target identity
+      copy:
+        content: >-
+          {{ [{'targets': ['127.0.0.1:' ~ (dingo_monitor_discovery_metrics_port | string)],
+               'labels': {'cluster': dingofs_cluster_name, 'component': 'discovery',
+                          'node': dingo_monitor_central_host}}] | to_nice_json }}
+        dest: "{{ dingo_monitor_data_dir }}/prometheus/data/discovery-targets.json"
+        mode: "0644"
+
+    - name: Point the provisioned data source at this cluster's Prometheus port
+      copy:
+        content: "{{ lookup('file', dingo_monitor_observability_assets_dir ~ '/grafana/provisioning/datasources/all.yml') | replace('localhost:9090', 'localhost:' ~ dingo_monitor_prometheus_port) }}\n"
+        dest: "{{ dingo_monitor_data_dir }}/grafana/provisioning/datasources/all.yml"
+        mode: "0644"
+      register: _monitor_datasource
+
+    - name: Restart discovery after reviewed configuration changes
+      command:
+        argv: ["{{ dingo_cli_bin_dir }}/dingo", monitor, restart, --role, monitor_sync]
+        stdin: "yes\n"
+      environment:
+        DINGO_CLUSTER: "{{ dingofs_cluster_name }}"
+        dingo_cluster: "{{ dingofs_cluster_name }}"
+      when: _monitor_other_assets.changed or _monitor_discovery_config.changed or _monitor_inventory.changed
+
+    - name: Restart Prometheus after validated rule changes
+      command:
+        argv: ["{{ dingo_cli_bin_dir }}/dingo", monitor, restart, --role, prometheus]
+        stdin: "yes\n"
+      environment:
+        DINGO_CLUSTER: "{{ dingofs_cluster_name }}"
+        dingo_cluster: "{{ dingofs_cluster_name }}"
+      when: _monitor_prom_assets.changed
+
+    - name: Restart Grafana after provisioning changes
+      command:
+        argv: ["{{ dingo_cli_bin_dir }}/dingo", monitor, restart, --role, grafana]
+        stdin: "yes\n"
+      environment:
+        DINGO_CLUSTER: "{{ dingofs_cluster_name }}"
+        dingo_cluster: "{{ dingofs_cluster_name }}"
+      when: _monitor_other_assets.changed or _monitor_datasource.changed
+
+  always:
+    - name: Remove this run's validation directory
+      file:
+        path: "{{ _monitor_stage.path }}"
+        state: absent
+      when: _monitor_stage.path is defined
+      changed_when: false

@@ -1,0 +1,11 @@
+[path]
+target_path=prometheus/data/targets.json
+state_path=prometheus/data/discovery-state.json
+inventory_path=prometheus/expected-targets.json
+
+[discovery]
+cluster={{ dingofs_cluster_name }}
+interval={{ dingo_monitor_discovery_interval }}
+timeout=5
+retention_seconds={{ dingo_monitor_discovery_retention_seconds }}
+metrics_listen=127.0.0.1:{{ dingo_monitor_discovery_metrics_port }}

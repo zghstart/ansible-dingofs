@@ -1,5 +1,13 @@
 ---
 # ============================================================
+
+- name: Validate monitoring host coverage
+  assert:
+    that:
+      - dingo_monitor_hosts | length > 0
+      - dingo_monitor_central_host in dingo_monitor_hosts
+      - ((groups['meta_servers'] | default([]) + groups['cache_servers'] | default([]) + groups['client_servers'] | default([])) | difference(dingo_monitor_hosts)) | length == 0
+    fail_msg: "Monitoring hosts must cover metadata, cache and client hosts, including the central host. Register them in dingo hosts before deployment."
 # Role: dingo_monitor - Deploy the dingo monitor stack
 # ============================================================
 
@@ -157,3 +165,9 @@
 - name: Display monitor status
   debug:
     var: monitor_status.stdout_lines
+
+- name: Apply reviewed P0 monitoring assets
+  include_tasks: observability.yml
+  when:
+    - dingo_monitor_observability_assets_dir | length > 0
+    - not ansible_check_mode
