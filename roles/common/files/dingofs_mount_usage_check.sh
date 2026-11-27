@@ -41,9 +41,8 @@ Usage: $PROG <mount_point> [--dry-run] [--strict] [--ignore-stale-mounts] [--ser
   --dry-run              Report the decision without changing anything (default behaviour).
   --strict               Inspect ALL containers and other process mount namespaces.
                          Default: only Kubernetes namespaces beginning with 'cci'.
-  --ignore-stale-mounts  Treat mounts with zero host users and only STALE container
-                         references (different/disconnected FUSE superblock) as IDLE.
-                         Any LIVE container reference still returns BUSY.
+  --ignore-stale-mounts  Ignore private DingoFS references with a confirmed
+                         ENOTCONN error. Other references still block restart.
   --service NAME         Use NAME instead of auto-detecting the systemd unit.
 EOF
 }
@@ -129,18 +128,23 @@ detect_service() {
 
 # --- Check 1: host processes with open files --------------------------------
 host_processes_busy() {
-    local mp=$1
+    local mp=$1 output rc=0
     if ! command -v fuser >/dev/null 2>&1; then
         log "ERROR: fuser is required to establish mount usage."
         return 2
     fi
-    if fuser -m "$mp" >/dev/null 2>&1; then
+    output=$(fuser -m "$mp" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
         fuser -vm "$mp" 2>&1 | while IFS= read -r line; do
             [ -n "$line" ] && log "    $line"
         done
         return 0
     fi
-    return 1
+    if [ "$rc" -eq 1 ] && [ -z "$output" ]; then
+        return 1
+    fi
+    log "ERROR: fuser could not establish usage for $mp (rc=$rc): $output"
+    return 2
 }
 
 # --- Check 2: other mount namespaces holding the same filesystem ------------
@@ -244,6 +248,7 @@ container_users_busy() {
     fi
 
     python3 - "$mp" "$strict" "$ignore_stale" <<'PY'
+import errno
 import json
 import os
 import posixpath
@@ -277,6 +282,7 @@ def mountinfo(path):
             raise ValueError("invalid mountinfo at " + str(path))
         unescape = lambda value: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
         rows.append({
+            "id": fields[0],
             "device": fields[2],
             "root": unescape(fields[3]),
             "path": unescape(fields[4]),
@@ -364,14 +370,57 @@ def host_device_for_path(path, host_rows):
     return "%s:%s" % (os.major(device), os.minor(device))
 
 
-def row_is_live(row, target_device, target_peers):
+def unique_dingofs_mount(host_rows, target, target_device):
+    matches = [row for row in host_rows if row["path"] == target]
+    if len(matches) == 1:
+        row = matches[0]
+        if (row["device"] == target_device
+                and row["fstype"] in ("fuse", "fuse.dingofs")
+                and row["source"].startswith("DingoFS:")):
+            return row
+    return None
+
+
+def confirms_disconnect(pid, row, rows):
+    # Use the container's view of the mount and bound the FUSE metadata probe.
+    # A different device ID alone says nothing about whether a daemon is alive.
+    probe = """
+import errno, os, sys
+try:
+    os.stat(sys.argv[1])
+except OSError as error:
+    sys.exit(errno.ENOTCONN if error.errno == errno.ENOTCONN else 1)
+"""
+    path = row["path"]
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe, "/proc/%s/root%s" % (pid, path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != errno.ENOTCONN:
+        return False
+    # A mount change during the probe invalidates the reference scan.
+    return mountinfo("/proc/%s/mountinfo" % pid) == rows
+
+
+def mount_usage(row, rows, pid, target_device, target_peers, host_mount):
     if target_device is None:
-        return True, "host-unmounted"
+        return "BUSY", "host-unmounted"
     if row["device"] == target_device:
-        return True, "dev=%s" % row["device"]
+        return "LIVE", "dev=%s" % row["device"]
     if target_peers and (peer_groups(row) & target_peers):
-        return True, "dev=%s shared-propagation" % row["device"]
-    return False, "dev=%s != host %s" % (row["device"], target_device)
+        return "LIVE", "dev=%s shared-propagation" % row["device"]
+    difference = "dev=%s != host %s" % (row["device"], target_device)
+    if (host_mount is not None
+            and row["fstype"] in ("fuse", "fuse.dingofs")
+            and row.get("source") == host_mount["source"]
+            and not row.get("optional")
+            and sum(mount["path"] == row["path"] for mount in rows) == 1
+            and confirms_disconnect(pid, row, rows)):
+        return "STALE", difference + ", ENOTCONN"
+    return "BUSY", difference + ", disconnect unconfirmed"
 
 
 def classify_container_references(detail, target, target_device,
@@ -404,11 +453,9 @@ def classify_container_references(detail, target, target_device,
                 direct.append((destination, label, "same mounted filesystem"))
     if target_device is None and not ancestors:
         return [
-            ("LIVE", "[LIVE host-unmounted] %s (%s)" % (label, kind))
+            ("BUSY", "[BUSY host-unmounted] %s (%s)" % (label, kind))
             for _, label, kind in direct
         ]
-    if not direct and not ancestors and target_device is None:
-        return []
     # Inspect the container's actual mount namespace whenever the host target
     # is mounted (to distinguish LIVE vs STALE superblocks and catch bind
     # aliases) or an ancestor bind mount may carry a retained child mount.
@@ -416,47 +463,34 @@ def classify_container_references(detail, target, target_device,
     if not re.fullmatch(r"[1-9][0-9]*", pid):
         raise ValueError("container PID is unavailable; cannot inspect mount namespace")
     rows = mountinfo("/proc/%s/mountinfo" % pid)
+    host_mount = unique_dingofs_mount(host_rows, target, target_device)
     results = []
     covered_live_paths = set()
+
+    def add_reference(row, label):
+        state, reason = mount_usage(row, rows, pid, target_device, target_peers, host_mount)
+        results.append((state, "[%s %s] %s" % (state, reason, label)))
+        if state == "LIVE":
+            covered_live_paths.add(row["path"])
+
     for destination, label, kind in direct:
         if target_device is None:
-            results.append(("LIVE", "[LIVE host-unmounted] %s (%s)" % (label, kind)))
+            results.append(("BUSY", "[BUSY host-unmounted] %s (%s)" % (label, kind)))
             continue
         if not isinstance(destination, str) or not posixpath.isabs(destination):
-            results.append(("LIVE", "[LIVE mountinfo-unmatched] %s (%s)" % (label, kind)))
+            results.append(("BUSY", "[BUSY mountinfo-unmatched] %s (%s)" % (label, kind)))
             continue
         dest_norm = posixpath.normpath(destination)
-        matched = [row for row in rows if at_or_below(row["path"], dest_norm)]
-        if not matched:
-            results.append(("LIVE", "[LIVE mountinfo-unmatched] %s (%s)" % (label, kind)))
+        if not any(row["path"] == dest_norm for row in rows):
+            results.append(("BUSY", "[BUSY mountinfo-unmatched] %s (%s)" % (label, kind)))
             continue
-        live_reasons, stale_reasons = [], []
-        for row in matched:
-            is_live, reason = row_is_live(row, target_device, target_peers)
-            if is_live:
-                live_reasons.append(reason)
-                covered_live_paths.add(row["path"])
-            else:
-                stale_reasons.append(reason)
-        if live_reasons:
-            reasons = ", ".join(dict.fromkeys(live_reasons))
-            results.append(("LIVE", "[LIVE %s] %s (%s)" % (reasons, label, kind)))
-        else:
-            reasons = ", ".join(dict.fromkeys(stale_reasons))
-            results.append(("STALE", "[STALE %s] %s (%s)" % (reasons, label, kind)))
+        for row in rows:
+            if at_or_below(row["path"], dest_norm):
+                add_reference(row, "%s (%s, mounted at %s)" % (label, kind, row["path"]))
     for mapped, label in ancestors:
         for row in rows:
             if at_or_below(row["path"], mapped):
-                is_live, reason = row_is_live(row, target_device, target_peers)
-                state = "LIVE" if is_live else "STALE"
-                if is_live:
-                    covered_live_paths.add(row["path"])
-                    if target_device is None:
-                        reason = "dev=%s host-unmounted" % row["device"]
-                results.append((
-                    state,
-                    "[%s %s] %s (mounted in container at %s)" % (state, reason, label, row["path"]),
-                ))
+                add_reference(row, "%s (mounted in container at %s)" % (label, row["path"]))
     if target_device is not None:
         # Always check the entire container mount namespace for any remaining
         # LIVE mounts of target_device (covers bind aliases that no longer
@@ -516,10 +550,10 @@ def check_cri(target, strict=False, ignore_stale=False):
                 target_peers=target_peers, host_rows=host_rows):
             entry = "    pod=%s/%s container=%s %s" % (
                 namespace, pod_name, container_id[:13], reference)
-            if state == "LIVE":
-                live_hits.append(entry)
-            else:
+            if state == "STALE":
                 stale_hits.append(entry)
+            else:
+                live_hits.append(entry)
     if live_hits:
         log("IN USE (containers referencing %s, via crictl):" % target)
         for hit in live_hits + stale_hits:
@@ -589,10 +623,10 @@ def check_ctr(target, strict=False, ignore_stale=False):
                     target_peers=target_peers, host_rows=host_rows):
                 entry = '    runtime_ns=%s pod=%s/%s container=%s %s' % (
                     runtime_namespace, namespace or 'non-kubernetes', pod, container_id[:13], reference)
-                if ref_state == 'LIVE':
-                    live_hits.append(entry)
-                else:
+                if ref_state == 'STALE':
                     stale_hits.append(entry)
+                else:
+                    live_hits.append(entry)
     if live_hits:
         log('IN USE (containers referencing %s, via ctr):' % target)
         for hit in live_hits + stale_hits:
@@ -634,6 +668,7 @@ def check_plain_namespaces(target, ignore_stale=False):
     target = canonical_host_path(target, host_rows)
     target_device = mounted_device(target)
     target_peers = target_peer_groups_for(host_rows, target, target_device)
+    host_mount = unique_dingofs_mount(host_rows, target, target_device)
     host_namespace = os.readlink('/proc/1/ns/mnt')
     seen = {host_namespace, os.readlink('/proc/self/ns/mnt')}
     ambiguous = False
@@ -655,11 +690,12 @@ def check_plain_namespaces(target, ignore_stale=False):
             if target_device is not None and row['device'] == target_device:
                 live_hits.append('pid=%s path=%s [LIVE dev=%s]' % (process.name, row['path'], row['device']))
             elif at_or_below(row['path'], target):
-                is_live, reason = row_is_live(row, target_device, target_peers)
-                if is_live:
-                    live_hits.append('pid=%s path=%s [LIVE %s]' % (process.name, row['path'], reason))
+                state, reason = mount_usage(row, rows, process.name, target_device, target_peers, host_mount)
+                hit = 'pid=%s path=%s [%s %s]' % (process.name, row['path'], state, reason)
+                if state == 'STALE':
+                    stale_hits.append(hit)
                 else:
-                    stale_hits.append('pid=%s path=%s [STALE %s]' % (process.name, row['path'], reason))
+                    live_hits.append(hit)
             elif target_device is None and row['fstype'].startswith('fuse') and row.get('source', '').startswith('DingoFS:'):
                 ambiguous = True
     if live_hits:
@@ -739,12 +775,12 @@ else
     log "Container scope: Kubernetes cci* namespaces and standalone containerd tasks."
 fi
 if $IGNORE_STALE; then
-    log "Stale container mounts: ignored (--ignore-stale-mounts); live references still block."
+    log "Only confirmed disconnected mounts may be ignored (--ignore-stale-mounts)."
 fi
 
 if ! is_host_mounted "$MOUNTPOINT"; then
     # Containers may retain a bind mount after the host path was detached.
-    if container_users_busy "$MOUNTPOINT"; then
+    if IGNORE_STALE=false container_users_busy "$MOUNTPOINT"; then
         log "BUSY: a container still references $MOUNTPOINT."
         exit 1
     else

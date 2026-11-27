@@ -931,15 +931,17 @@ Host process usage is still checked in both modes; an unavailable required check
 returns 2 and prevents changes. Upgrades retain a per-instance restart marker
 until the new mount has been verified.
 
-When the host mount is active, the checker resolves its `major:minor` device directly
-from `/proc/self/mountinfo` (avoiding `stat()` on a potentially stalled FUSE mount)
-and inspects each matching container's `/proc/<pid>/mountinfo` to tag references as
-`LIVE` (matching host device or active mount propagation) or `STALE` (an obsolete
-superblock from an earlier mount lifecycle). By default both `LIVE` and `STALE`
-references report `BUSY` (exit 1); opt in with `--ignore-stale-mounts` (or
-`dingo_client_ignore_stale_mounts: true`) to allow restarts when host processes are
-idle and every container reference is `STALE` only. Any `LIVE` reference still
-blocks, and unreadable container `mountinfo` remains `UNKNOWN` (exit 2).
+The checker reads the host mount's `major:minor` from `/proc/self/mountinfo`.
+For a container reference on a different device, `STALE` requires a private
+DingoFS mount of the same filesystem and a timed metadata probe that returns
+`ENOTCONN`. A responding mount, ambiguous mount identity or failed probe
+continues to block restarts.
+
+The default policy reports `BUSY` (exit 1) for these references. With
+`--ignore-stale-mounts` or `dingo_client_ignore_stale_mounts: true`, only
+confirmed disconnected references are skipped. Host process and current mount
+references still block. Unreadable `mountinfo` prevents the checker from
+establishing that the mount is idle.
 
 When multiple unit files declare a mountpoint, the checker identifies a unique
 running unit. Conflicting live matches and units transitioning at that path
