@@ -14,7 +14,7 @@
 #
 # Usage:
 #   dingofs_mount_usage_check.sh <mount_point> [--dry-run] [--strict]
-#                                  [--service NAME]
+#                                  [--ignore-stale-mounts] [--service NAME]
 #
 # Exit status:
 #   0 = IDLE    (safe to stop/remount)
@@ -29,18 +29,22 @@ set -u
 PROG=$(basename "$0")
 DRY_RUN=false
 STRICT=false
+IGNORE_STALE=false
 MOUNTPOINT=""
 SERVICE_OVERRIDE=""
 
 usage() {
     cat <<EOF
-Usage: $PROG <mount_point> [--dry-run] [--strict] [--service NAME]
+Usage: $PROG <mount_point> [--dry-run] [--strict] [--ignore-stale-mounts] [--service NAME]
 
-  <mount_point>   Absolute path of the DingoFS mount to inspect.
-  --dry-run       Report the decision without changing anything (default behaviour).
-  --strict        Inspect ALL containers and other process mount namespaces.
-                  Default: only Kubernetes namespaces beginning with 'cci'.
-  --service NAME  Use NAME instead of auto-detecting the systemd unit.
+  <mount_point>          Absolute path of the DingoFS mount to inspect.
+  --dry-run              Report the decision without changing anything (default behaviour).
+  --strict               Inspect ALL containers and other process mount namespaces.
+                         Default: only Kubernetes namespaces beginning with 'cci'.
+  --ignore-stale-mounts  Treat mounts with zero host users and only STALE container
+                         references (different/disconnected FUSE superblock) as IDLE.
+                         Any LIVE container reference still returns BUSY.
+  --service NAME         Use NAME instead of auto-detecting the systemd unit.
 EOF
 }
 
@@ -48,6 +52,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true ;;
         --strict) STRICT=true ;;
+        --ignore-stale-mounts) IGNORE_STALE=true ;;
         --service)
             shift
             [ $# -gt 0 ] || { echo "$PROG: --service requires a value" >&2; exit 2; }
@@ -142,12 +147,45 @@ host_processes_busy() {
 # Bind mounts (container hostPath) keep the source superblock's st_dev, so
 # comparing major:minor catches paths that differ from the host mountpoint.
 stat_dev() {
-    local mp=$1 raw major minor
+    local mp=$1
     python3 - "$mp" <<'PYDEV'
-import os, sys
-value = os.stat(sys.argv[1]).st_dev
+import os, posixpath, re, sys
+from pathlib import Path
+
+target = posixpath.normpath(sys.argv[1])
+mi = Path("/proc/self/mountinfo")
+if mi.exists():
+    unescape = lambda value: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
+    rows = []
+    for line in mi.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 5:
+            rows.append((unescape(fields[4]), fields[2]))
+    matches = [dev for path, dev in rows if path == target]
+    if matches:
+        print(matches[-1])
+        sys.exit(0)
+    parent, name = posixpath.split(target)
+    if name:
+        candidate = posixpath.normpath(posixpath.join(os.path.realpath(parent), name))
+        if candidate != target:
+            matches = [dev for path, dev in rows if path == candidate]
+            if matches:
+                print(matches[-1])
+                sys.exit(0)
+    sys.exit(1)
+value = os.stat(target).st_dev
 print("%s:%s" % (os.major(value), os.minor(value)))
 PYDEV
+}
+
+is_host_mounted() {
+    local mp=$1
+    if [ -r /proc/self/mountinfo ] && command -v python3 >/dev/null 2>&1; then
+        stat_dev "$mp" >/dev/null 2>&1
+        return $?
+    fi
+    [ -e "$mp" ] && mountpoint -q "$mp" 2>/dev/null
 }
 
 namespace_users_busy() {
@@ -196,15 +234,16 @@ namespace_users_busy() {
 # Runtime inspection is done in python3: it is far less error-prone than
 # shelling out once per field, and python3 is already required by Ansible.
 container_users_busy() {
-    local mp=$1 strict=0
-    $STRICT && strict=1
+    local mp=$1 strict=0 ignore_stale=0
+    ${STRICT:-false} && strict=1
+    ${IGNORE_STALE:-false} && ignore_stale=1
 
     if ! command -v python3 >/dev/null 2>&1; then
         log "ERROR: python3 is required for container checks."
         return 2
     fi
 
-    python3 - "$mp" "$strict" <<'PY'
+    python3 - "$mp" "$strict" "$ignore_stale" <<'PY'
 import json
 import os
 import posixpath
@@ -237,75 +276,216 @@ def mountinfo(path):
         if separator < 6 or len(fields) < separator + 4:
             raise ValueError("invalid mountinfo at " + str(path))
         unescape = lambda value: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
-        rows.append({"device": fields[2], "path": unescape(fields[4]),
-                     "fstype": fields[separator + 1], "source": unescape(fields[separator + 2])})
+        rows.append({
+            "device": fields[2],
+            "root": unescape(fields[3]),
+            "path": unescape(fields[4]),
+            "optional": fields[6:separator],
+            "fstype": fields[separator + 1],
+            "source": unescape(fields[separator + 2]),
+        })
     return rows
 
 
+def host_mountinfo():
+    path = Path("/proc/self/mountinfo")
+    if not path.exists():
+        return []
+    return mountinfo(path)
+
+
+def peer_groups(row):
+    groups = set()
+    for field in row.get("optional") or ():
+        if field.startswith("shared:") or field.startswith("master:"):
+            groups.add(field.split(":", 1)[1])
+    return groups
+
+
+def canonical_host_path(path, host_rows=None):
+    norm = posixpath.normpath(path)
+    if host_rows is None:
+        host_rows = host_mountinfo()
+    # Never stat/lstat at or below a mounted FUSE path: a stalled FUSE daemon
+    # would hang os.path.realpath(). Resolve symlinked parents outside mounts.
+    mounted_paths = {row["path"] for row in host_rows}
+    if norm in mounted_paths:
+        return norm
+    fuse_mounts = sorted(
+        (row["path"] for row in host_rows if row.get("fstype", "").startswith("fuse")),
+        key=len,
+        reverse=True,
+    )
+    for mp in fuse_mounts:
+        if at_or_below(norm, mp):
+            return norm
+    parent, name = posixpath.split(norm)
+    if name:
+        resolved_parent = os.path.realpath(parent)
+        candidate = posixpath.normpath(posixpath.join(resolved_parent, name))
+        if candidate in mounted_paths:
+            return candidate
+        for mp in fuse_mounts:
+            if at_or_below(candidate, mp):
+                return candidate
+    return os.path.realpath(norm)
+
+
 def mounted_device(target):
-    # An unmounted directory shares the root filesystem with unrelated paths.
-    # Only use filesystem identity if this exact target is a real mountpoint.
-    if any(row["path"] == target for row in mountinfo("/proc/self/mountinfo")):
-        device = os.stat(target).st_dev
-        return "%s:%s" % (os.major(device), os.minor(device))
-    return None
+    # Read major:minor directly from /proc/self/mountinfo instead of calling
+    # os.stat(target), which can hang if the target FUSE daemon is stalled.
+    # An unmounted directory has no mountinfo entry and returns None.
+    matches = [row for row in mountinfo("/proc/self/mountinfo") if row["path"] == target]
+    return matches[-1]["device"] if matches else None
 
 
-def container_references(detail, target, target_device):
+def target_peer_groups_for(host_rows, target, target_device):
+    if target_device is None:
+        return set()
+    matches = [
+        row for row in host_rows
+        if row["path"] == target and row["device"] == target_device
+    ]
+    return peer_groups(matches[-1]) if matches else set()
+
+
+def host_device_for_path(path, host_rows):
+    best = None
+    for row in host_rows:
+        if at_or_below(path, row["path"]):
+            if best is None or len(row["path"]) >= len(best["path"]):
+                best = row
+    if best is not None:
+        return best["device"]
+    try:
+        device = os.stat(path).st_dev
+    except FileNotFoundError:
+        return None
+    return "%s:%s" % (os.major(device), os.minor(device))
+
+
+def row_is_live(row, target_device, target_peers):
+    if target_device is None:
+        return True, "host-unmounted"
+    if row["device"] == target_device:
+        return True, "dev=%s" % row["device"]
+    if target_peers and (peer_groups(row) & target_peers):
+        return True, "dev=%s shared-propagation" % row["device"]
+    return False, "dev=%s != host %s" % (row["device"], target_device)
+
+
+def classify_container_references(detail, target, target_device,
+                                  target_peers=None, host_rows=None):
+    target_peers = set(target_peers or ())
+    host_rows = [] if host_rows is None else host_rows
     info = detail.get("info") or {}
     mounts = (detail.get("status") or {}).get("mounts") or []
     if not mounts:
         mounts = (info.get("runtimeSpec") or {}).get("mounts") or []
-    hits, ancestors = [], []
+    direct, ancestors = [], []
     for mount in mounts:
         source = mount.get("hostPath") or mount.get("source") or ""
         destination = mount.get("containerPath") or mount.get("destination") or ""
         # OCI pseudo-filesystem sources such as 'proc' are not host paths.
         if not isinstance(source, str) or not os.path.isabs(source):
             continue
-        source = os.path.realpath(source)
+        source = canonical_host_path(source, host_rows)
         label = "hostPath=%s -> %s" % (source, destination)
         if at_or_below(source, target):
             # Keep detecting direct references after a host mount is detached.
-            hits.append(label + " (target path)")
+            direct.append((destination, label, "target path"))
         elif at_or_below(target, source):
             if not isinstance(destination, str) or not posixpath.isabs(destination):
                 raise ValueError("ancestor hostPath has no absolute container destination")
             mapped = posixpath.normpath(posixpath.join(destination, os.path.relpath(target, source)))
             ancestors.append((mapped, label))
         elif target_device is not None:
-            try:
-                device = os.stat(source).st_dev
-            except FileNotFoundError:
-                continue
-            if "%s:%s" % (os.major(device), os.minor(device)) == target_device:
-                hits.append(label + " (same mounted filesystem)")
-    if hits:
-        return hits
-    if not ancestors and target_device is None:
+            if host_device_for_path(source, host_rows) == target_device:
+                direct.append((destination, label, "same mounted filesystem"))
+    if target_device is None and not ancestors:
+        return [
+            ("LIVE", "[LIVE host-unmounted] %s (%s)" % (label, kind))
+            for _, label, kind in direct
+        ]
+    if not direct and not ancestors and target_device is None:
         return []
-    # A container binding '/' does not automatically hold every possible future
-    # child mount. Inspect its namespace for an actual mapped mount, including
-    # a retained FUSE mount that has already been detached on the host.
+    # Inspect the container's actual mount namespace whenever the host target
+    # is mounted (to distinguish LIVE vs STALE superblocks and catch bind
+    # aliases) or an ancestor bind mount may carry a retained child mount.
     pid = str(info.get("pid", ""))
     if not re.fullmatch(r"[1-9][0-9]*", pid):
         raise ValueError("container PID is unavailable; cannot inspect mount namespace")
     rows = mountinfo("/proc/%s/mountinfo" % pid)
+    results = []
+    covered_live_paths = set()
+    for destination, label, kind in direct:
+        if target_device is None:
+            results.append(("LIVE", "[LIVE host-unmounted] %s (%s)" % (label, kind)))
+            continue
+        if not isinstance(destination, str) or not posixpath.isabs(destination):
+            results.append(("LIVE", "[LIVE mountinfo-unmatched] %s (%s)" % (label, kind)))
+            continue
+        dest_norm = posixpath.normpath(destination)
+        matched = [row for row in rows if at_or_below(row["path"], dest_norm)]
+        if not matched:
+            results.append(("LIVE", "[LIVE mountinfo-unmatched] %s (%s)" % (label, kind)))
+            continue
+        live_reasons, stale_reasons = [], []
+        for row in matched:
+            is_live, reason = row_is_live(row, target_device, target_peers)
+            if is_live:
+                live_reasons.append(reason)
+                covered_live_paths.add(row["path"])
+            else:
+                stale_reasons.append(reason)
+        if live_reasons:
+            reasons = ", ".join(dict.fromkeys(live_reasons))
+            results.append(("LIVE", "[LIVE %s] %s (%s)" % (reasons, label, kind)))
+        else:
+            reasons = ", ".join(dict.fromkeys(stale_reasons))
+            results.append(("STALE", "[STALE %s] %s (%s)" % (reasons, label, kind)))
     for mapped, label in ancestors:
         for row in rows:
             if at_or_below(row["path"], mapped):
-                hits.append(label + " (mounted in container at %s)" % row["path"])
-    if target_device is not None and not hits:
-        # Covers bind aliases that no longer exist at their original host path.
+                is_live, reason = row_is_live(row, target_device, target_peers)
+                state = "LIVE" if is_live else "STALE"
+                if is_live:
+                    covered_live_paths.add(row["path"])
+                    if target_device is None:
+                        reason = "dev=%s host-unmounted" % row["device"]
+                results.append((
+                    state,
+                    "[%s %s] %s (mounted in container at %s)" % (state, reason, label, row["path"]),
+                ))
+    if target_device is not None:
+        # Always check the entire container mount namespace for any remaining
+        # LIVE mounts of target_device (covers bind aliases that no longer
+        # exist at their original host path, or LIVE aliases coexisting with
+        # a STALE direct mount in the same container).
         for row in rows:
-            if row["device"] == target_device:
-                hits.append("mount_path_in_ns=%s (same mounted filesystem)" % row["path"])
-    return hits
+            if row["device"] == target_device and row["path"] not in covered_live_paths:
+                covered_live_paths.add(row["path"])
+                results.append((
+                    "LIVE",
+                    "[LIVE dev=%s] mount_path_in_ns=%s (same mounted filesystem)" % (row["device"], row["path"]),
+                ))
+    return results
 
 
-def check_cri(target, strict=False):
-    target = os.path.realpath(target)
+def container_references(detail, target, target_device,
+                         target_peers=None, host_rows=None, ignore_stale=False):
+    refs = classify_container_references(
+        detail, target, target_device,
+        target_peers=target_peers, host_rows=host_rows,
+    )
+    return [text for state, text in refs if not (ignore_stale and state == "STALE")]
+
+
+def check_cri(target, strict=False, ignore_stale=False):
+    host_rows = host_mountinfo()
+    target = canonical_host_path(target, host_rows)
     target_device = mounted_device(target)
+    target_peers = target_peer_groups_for(host_rows, target, target_device)
     pod_response = cri("pods", "-o", "json")
     container_response = cri("ps", "-o", "json", "--state", "Running")
     for response, key in [(pod_response, "items"), (container_response, "containers")]:
@@ -319,7 +499,7 @@ def check_cri(target, strict=False):
     for pod in pods:
         meta = pod.get("metadata") or {}
         pod_meta[pod.get("id", "")] = (meta.get("namespace", ""), meta.get("name", ""))
-    hits = []
+    live_hits, stale_hits = [], []
     for container in containers:
         namespace, pod_name = pod_meta.get(container.get("podSandboxId", ""), ("", ""))
         if not strict:
@@ -331,15 +511,32 @@ def check_cri(target, strict=False):
         if not container_id:
             raise ValueError("running container has no ID")
         detail = cri("inspect", "-o", "json", container_id)
-        for reference in container_references(detail, target, target_device):
-            hits.append("    pod=%s/%s container=%s %s" %
-                        (namespace, pod_name, container_id[:13], reference))
-    if hits:
+        for state, reference in classify_container_references(
+                detail, target, target_device,
+                target_peers=target_peers, host_rows=host_rows):
+            entry = "    pod=%s/%s container=%s %s" % (
+                namespace, pod_name, container_id[:13], reference)
+            if state == "LIVE":
+                live_hits.append(entry)
+            else:
+                stale_hits.append(entry)
+    if live_hits:
         log("IN USE (containers referencing %s, via crictl):" % target)
-        for hit in hits:
+        for hit in live_hits + stale_hits:
             log(hit)
         return 1
     scope = "all namespaces" if strict else "'cci*' namespaces"
+    if stale_hits:
+        if ignore_stale:
+            log("STALE ONLY (ignoring stale container mounts referencing %s, via crictl; 0 LIVE):" % target)
+            for hit in stale_hits:
+                log(hit)
+            log("OK: no LIVE container in %s references %s." % (scope, target))
+            return 0
+        log("IN USE (containers referencing %s, via crictl; STALE only, pass --ignore-stale-mounts to allow restart):" % target)
+        for hit in stale_hits:
+            log(hit)
+        return 1
     log("OK: no container in %s references %s." % (scope, target))
     return 0
 
@@ -349,10 +546,12 @@ def ctr(*args):
                                    timeout=60, text=True)
 
 
-def check_ctr(target, strict=False):
-    target = os.path.realpath(target)
+def check_ctr(target, strict=False, ignore_stale=False):
+    host_rows = host_mountinfo()
+    target = canonical_host_path(target, host_rows)
     target_device = mounted_device(target)
-    hits = []
+    target_peers = target_peer_groups_for(host_rows, target, target_device)
+    live_hits, stale_hits = [], []
     for runtime_namespace in ctr('namespaces', 'list', '-q').split():
         lines = [line.split() for line in ctr('-n', runtime_namespace, 'tasks', 'list').splitlines() if line.strip()]
         if not lines or lines[0][:3] != ['TASK', 'PID', 'STATUS']:
@@ -385,12 +584,29 @@ def check_ctr(target, strict=False):
             if not isinstance(mounts, list):
                 raise ValueError('invalid ctr OCI mounts')
             adapted = {'info': {'pid': int(pid), 'runtimeSpec': {'mounts': mounts}}}
-            for reference in container_references(adapted, target, target_device):
-                hits.append('    runtime_ns=%s pod=%s/%s container=%s %s' %
-                            (runtime_namespace, namespace or 'non-kubernetes', pod, container_id[:13], reference))
-    if hits:
+            for ref_state, reference in classify_container_references(
+                    adapted, target, target_device,
+                    target_peers=target_peers, host_rows=host_rows):
+                entry = '    runtime_ns=%s pod=%s/%s container=%s %s' % (
+                    runtime_namespace, namespace or 'non-kubernetes', pod, container_id[:13], reference)
+                if ref_state == 'LIVE':
+                    live_hits.append(entry)
+                else:
+                    stale_hits.append(entry)
+    if live_hits:
         log('IN USE (containers referencing %s, via ctr):' % target)
-        for hit in hits:
+        for hit in live_hits + stale_hits:
+            log(hit)
+        return 1
+    if stale_hits:
+        if ignore_stale:
+            log('STALE ONLY (ignoring stale container mounts referencing %s, via ctr; 0 LIVE):' % target)
+            for hit in stale_hits:
+                log(hit)
+            log('OK: ctr found no LIVE selected running container referencing ' + target)
+            return 0
+        log('IN USE (containers referencing %s, via ctr; STALE only, pass --ignore-stale-mounts to allow restart):' % target)
+        for hit in stale_hits:
             log(hit)
         return 1
     log('OK: ctr found no selected running container referencing ' + target)
@@ -413,12 +629,15 @@ def runtime_present():
     return False
 
 
-def check_plain_namespaces(target):
-    target = os.path.realpath(target)
+def check_plain_namespaces(target, ignore_stale=False):
+    host_rows = host_mountinfo()
+    target = canonical_host_path(target, host_rows)
     target_device = mounted_device(target)
+    target_peers = target_peer_groups_for(host_rows, target, target_device)
     host_namespace = os.readlink('/proc/1/ns/mnt')
     seen = {host_namespace, os.readlink('/proc/self/ns/mnt')}
     ambiguous = False
+    live_hits, stale_hits = [], []
     for process in Path('/proc').iterdir():
         if not process.name.isdigit():
             continue
@@ -433,24 +652,41 @@ def check_plain_namespaces(target):
             continue
         seen.add(namespace)
         for row in rows:
-            if ((target_device is not None and row['device'] == target_device)
-                    or at_or_below(row['path'], target)):
-                log('IN USE (process namespace): pid=%s path=%s' % (process.name, row['path']))
-                return 1
-            if target_device is None and row['fstype'].startswith('fuse') and row.get('source', '').startswith('DingoFS:'):
+            if target_device is not None and row['device'] == target_device:
+                live_hits.append('pid=%s path=%s [LIVE dev=%s]' % (process.name, row['path'], row['device']))
+            elif at_or_below(row['path'], target):
+                is_live, reason = row_is_live(row, target_device, target_peers)
+                if is_live:
+                    live_hits.append('pid=%s path=%s [LIVE %s]' % (process.name, row['path'], reason))
+                else:
+                    stale_hits.append('pid=%s path=%s [STALE %s]' % (process.name, row['path'], reason))
+            elif target_device is None and row['fstype'].startswith('fuse') and row.get('source', '').startswith('DingoFS:'):
                 ambiguous = True
+    if live_hits:
+        for hit in live_hits + stale_hits:
+            log('IN USE (process namespace): ' + hit)
+        return 1
+    if stale_hits:
+        if ignore_stale:
+            for hit in stale_hits:
+                log('STALE ONLY (ignoring stale process namespace mount): ' + hit)
+            log('OK: no container runtime detected; no LIVE process mount namespace references %s.' % target)
+            return 0
+        for hit in stale_hits:
+            log('IN USE (process namespace; STALE only, pass --ignore-stale-mounts to allow restart): ' + hit)
+        return 1
     if ambiguous:
         raise ValueError('foreign namespace retains a DingoFS mount; cannot correlate an unmounted host path')
     log('OK: no container runtime detected; process mount namespaces checked.')
     return 0
 
 
-def check(target, strict=False):
+def check(target, strict=False, ignore_stale=False):
     errors = []
     cri_ok = False
     if shutil.which('crictl'):
         try:
-            if check_cri(target, strict) == 1:
+            if (check_cri(target, strict, ignore_stale) if ignore_stale else check_cri(target, strict)) == 1:
                 return 1
             cri_ok = True
         except Exception as error:
@@ -458,19 +694,20 @@ def check(target, strict=False):
             log('CRI query unavailable; trying containerd/ctr if present.')
     if shutil.which('ctr'):
         try:
-            return check_ctr(target, strict)
+            return check_ctr(target, strict, ignore_stale) if ignore_stale else check_ctr(target, strict)
         except Exception as error:
             errors.append('ctr: ' + str(error))
     if cri_ok and not errors:
         return 0
     if errors or runtime_present():
         raise ValueError('; '.join(errors) or 'a container runtime/kubelet is active but neither crictl nor ctr can inspect it')
-    return check_plain_namespaces(target)
+    return check_plain_namespaces(target, ignore_stale) if ignore_stale else check_plain_namespaces(target)
 
 
 def main():
     try:
-        return check(sys.argv[1], sys.argv[2] == "1")
+        ignore_stale = len(sys.argv) > 3 and sys.argv[3] == "1"
+        return check(sys.argv[1], sys.argv[2] == "1", ignore_stale)
     except Exception as exc:
         print("ERROR: cannot establish container mount usage: %s" % exc, file=sys.stderr)
         return 2
@@ -501,8 +738,11 @@ if $STRICT; then
 else
     log "Container scope: Kubernetes cci* namespaces and standalone containerd tasks."
 fi
+if $IGNORE_STALE; then
+    log "Stale container mounts: ignored (--ignore-stale-mounts); live references still block."
+fi
 
-if [ ! -e "$MOUNTPOINT" ] || ! mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+if ! is_host_mounted "$MOUNTPOINT"; then
     # Containers may retain a bind mount after the host path was detached.
     if container_users_busy "$MOUNTPOINT"; then
         log "BUSY: a container still references $MOUNTPOINT."
