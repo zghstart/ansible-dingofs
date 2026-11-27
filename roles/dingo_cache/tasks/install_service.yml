@@ -29,7 +29,7 @@
 
 - name: Check NUMA memory before Cache activation
   when:
-    - dingo_cache_numa_mem_gate | default(false) | bool
+    - dingo_cache_numa_mem_gate | default(true) | bool
     - _cache_require_ib | default(false) | bool
   block:
     - import_tasks: inspect_runtime.yml

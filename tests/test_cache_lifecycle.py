@@ -97,7 +97,7 @@ m.exit_json(changed=False)
         self.inspector = self.root / 'inspect_runtime.yml'
         self.inspector.write_text(inspector.replace('/proc/', str(self.root / 'proc') + '/'))
 
-    def enable_numa_gate(self):
+    def configure_numa_memory_fixture(self):
         self.node_root = self.root / 'sys/node'
         self.set_free_memory(0, 2048)
         self.set_free_memory(1, 32768)
@@ -105,7 +105,7 @@ m.exit_json(changed=False)
         source = (REPO / 'library' / module).read_text()
         (self.library / module).write_text(source.replace(
             "Path('/sys/devices/system/node')", 'Path({!r})'.format(str(self.node_root))))
-        self.variables.update(dingo_cache_numa_mem_gate=True, _cache_require_ib=True,
+        self.variables.update(_cache_require_ib=True,
                               dingo_cache_numactl_node_effective=0, dingo_cache_buffer_pool_mb=512)
 
     def set_free_memory(self, node, free_mib):
@@ -200,7 +200,7 @@ m.exit_json(changed=False)
         self.assertEqual(self.restarts(), [])
 
     def test_numa_gate_blocks_file_replacement_and_service_changes(self):
-        self.enable_numa_gate()
+        self.configure_numa_memory_fixture()
         self.variables['fixture_log_level'] = 'error'
         result = self.run_play()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -212,7 +212,7 @@ m.exit_json(changed=False)
         self.assertFalse(self.service_actions.exists())
 
     def test_numa_gate_rechecks_pending_restart_when_files_already_match(self):
-        self.enable_numa_gate()
+        self.configure_numa_memory_fixture()
         self.candidate.write_text('old binary')
         self.marker.touch()
         result = self.run_play()
@@ -226,12 +226,19 @@ m.exit_json(changed=False)
         self.assertEqual(self.restarts(), ['restart'])
 
     def test_numa_gate_preserves_current_cache_and_allows_explicit_opt_out(self):
-        self.enable_numa_gate()
+        self.configure_numa_memory_fixture()
         self.candidate.write_text('old binary')
         self.assert_succeeded(self.run_play())
         self.assertEqual(self.restarts(), [])
         self.variables['dingo_cache_numa_mem_gate'] = False
         self.candidate.write_text('new binary')
+        self.assert_succeeded(self.run_play())
+        self.assertEqual(self.running.read_text(), 'new binary')
+        self.assertEqual(self.restarts(), ['restart'])
+
+    def test_numa_gate_only_applies_with_required_ib_locality(self):
+        self.configure_numa_memory_fixture()
+        self.variables['_cache_require_ib'] = False
         self.assert_succeeded(self.run_play())
         self.assertEqual(self.running.read_text(), 'new binary')
         self.assertEqual(self.restarts(), ['restart'])

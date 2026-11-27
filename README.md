@@ -862,11 +862,10 @@ alert threshold, not a reason to move CPUs to another NUMA node. Disabling
 `dingofs_numa_require_ib` restores memory-aware node selection and cross-node CPU
 fallback; RDMA-disabled hosts also retain that fallback behavior.
 
-For Cache, opt in with `dingo_cache_numa_mem_gate: true` to check free memory
-before `cache_05_deploy.yml` applies changes or starts a stopped/stale
-instance. The gate applies when both RDMA and required IB locality are enabled.
-It uses the selected NUMA node's `MemFree` and the v5.2 startup budget for all
-shards, including the data and RDMA message pools. A positive
+`cache_05_deploy.yml` checks free memory by default before applying service
+changes or starting a stopped or stale Cache when both RDMA and required IB
+locality are enabled. The gate compares that node's `MemFree` with the v5.2
+startup budget for all shards, including the data and RDMA message pools. A positive
 `dingo_cache_numa_min_free_mb` sets a floor in MiB if it exceeds that budget.
 An unchanged, current Cache without a pending restart skips the gate.
 
