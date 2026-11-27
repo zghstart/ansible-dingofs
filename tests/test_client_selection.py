@@ -141,7 +141,7 @@ class ClientSelectionIntegrationTests(unittest.TestCase):
             os.environ,
             ANSIBLE_CONFIG=str(REPO / "ansible.cfg"),
             ANSIBLE_ROLES_PATH=str(REPO / "roles"),
-            ANSIBLE_LIBRARY=str(self.library),
+            ANSIBLE_LIBRARY=os.pathsep.join((str(self.library), str(REPO / 'library'))),
             ANSIBLE_FILTER_PLUGINS=str(REPO / "filter_plugins"),
             ANSIBLE_STDOUT_CALLBACK="default",
             DINGO_CLIENT_REPORT_DIR=str(self.root / "reports"),
@@ -297,14 +297,13 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
         self.assertNotIn(str(self.root / "gpu01/manila/mount"), gpu01_script)
 
     def test_status_playbook_honors_enabled_and_dingo_client_only(self):
-        # Fake systemd: only dingospeed-public-v5.2 is active; alayanew and manila are inactive!
-        (self.library / "systemd.py").write_text(
-            "from ansible.module_utils.basic import AnsibleModule\n"
-            "m = AnsibleModule(argument_spec=dict(name=dict()))\n"
-            "active = 'active' if 'dingospeed-public' in m.params['name'] else 'inactive'\n"
-            "m.exit_json(changed=False, status={'ActiveState': active})\n"
-        )
+        # Fake systemctl: only the public service is active.
+        marker = self.root / ".restart-required"
+        marker.touch()
+        usage = self.fakebin / "usage-check"
+        usage.write_text("#!/bin/sh\nexit 1\n")
         for name, body in {
+            "systemctl": '#!/bin/sh\ncase "$*" in *dingospeed-public*) echo ActiveState=active;; *) echo ActiveState=inactive;; esac\n',
             "mountpoint": '#!/bin/sh\ntouch "$FUSE_PATH_PROBED"\nexit 1\n',
             "df": '#!/bin/sh\ntouch "$FUSE_PATH_PROBED"\nexit 1\n',
             "findmnt": '#!/bin/sh\necho \'{"filesystems":[{"fstype":"fuse.dingofs","source":"DingoFS:dingospeed-public"}]}\'\n',
@@ -323,7 +322,7 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
                     "dingo_clients": "{{ dingofs_host_vars.get(inventory_hostname, {}).get('dingo_clients', dingo_clients_default) }}",
                     "dingo_clients_default": [
                         {"fsname": "alayanew", "mount_point": "/mnt/alayanew"},
-                        {"fsname": "dingospeed-public", "mount_point": "/mnt/public-fs"},
+                        {"fsname": "dingospeed-public", "mount_point": "/mnt/public-fs", "base_dir": str(self.root)},
                         {"fsname": "manila", "mount_point": "/mnt/manila", "enabled": False},
                     ],
                     "dingofs_host_vars": {
@@ -347,12 +346,16 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
         # Filtering to dingospeed-public passes on gpu01 (ignoring inactive alayanew/manila) and skips gpu32
         ok = subprocess.run(
             ["ansible-playbook", "-i", str(inv_path), str(REPO / "playbooks/client_99_status.yml"),
-             "-e", "dingo_client_only=dingospeed-public"],
+             "-e", "dingo_client_only=dingospeed-public", "--check",
+             "-e", "dingo_client_status_check_usage=true",
+             "-e", "dingo_client_mount_check_script=" + str(usage)],
             cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
         self.assertIn("SKIP gpu32", ok.stdout)
         self.assertIn("/mnt/public-fs is mounted from DingoFS:dingospeed-public.", ok.stdout)
+        self.assertIn("restart_marker=present reconciliation=unknown usage=BUSY", ok.stdout)
+        self.assertTrue(marker.exists())
         self.assertFalse(path_probe.exists(), "status accessed the FUSE path")
 
         # Without dingo_client_only, enabled alayanew is checked (and fails because inactive)
@@ -443,11 +446,9 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
         }
         mixed_inv_path = self.root / "mixed-status-inv.yml"
         mixed_inv_path.write_text(yaml.safe_dump(mixed_inv, sort_keys=False))
-        (self.library / "systemd.py").write_text(
-            "from ansible.module_utils.basic import AnsibleModule\n"
-            "m = AnsibleModule(argument_spec=dict(name=dict()))\n"
-            "m.exit_json(changed=False, status={'ActiveState': 'active'})\n"
-        )
+        systemctl = self.fakebin / "systemctl"
+        systemctl.write_text("#!/bin/sh\necho ActiveState=active\n")
+        systemctl.chmod(0o755)
         for name, body in {
             "findmnt": '#!/bin/sh\necho \'{"filesystems":[{"fstype":"fuse.dingofs","source":"DingoFS:shared"}]}\'\n',
         }.items():

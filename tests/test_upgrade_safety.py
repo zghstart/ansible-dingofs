@@ -58,7 +58,8 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
                      'tasks': tasks}]
             play_path = root / 'play.yml'
             play_path.write_text(yaml.safe_dump(play))
-            env = dict(os.environ, ANSIBLE_CONFIG=str(REPO / 'ansible.cfg'), ANSIBLE_LIBRARY=str(library))
+            env = dict(os.environ, ANSIBLE_CONFIG=str(REPO / 'ansible.cfg'),
+                       ANSIBLE_LIBRARY=os.pathsep.join((str(library), str(REPO / 'library'))))
             for attempt in range(2):
                 result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(play_path)],
                                         cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
@@ -166,7 +167,8 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
                                 'vars': {'client_instance': client}}]}]
             play_path = root / 'play.yml'
             play_path.write_text(yaml.safe_dump(play))
-            env = dict(os.environ, ANSIBLE_CONFIG=str(REPO / 'ansible.cfg'), ANSIBLE_LIBRARY=str(library))
+            env = dict(os.environ, ANSIBLE_CONFIG=str(REPO / 'ansible.cfg'),
+                       ANSIBLE_LIBRARY=os.pathsep.join((str(library), str(REPO / 'library'))))
             # Default (dingo_client_ignore_stale_mounts=false): checker gets no flag and skips.
             res_default = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(play_path)],
                                          cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
