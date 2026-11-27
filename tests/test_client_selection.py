@@ -376,6 +376,41 @@ print(json.dumps({'filesystems': [{'fstype': 'fuse.dingofs', 'source': 'DingoFS:
         self.assertNotEqual(fail_disabled.returncode, 0, fail_disabled.stdout + fail_disabled.stderr)
         self.assertIn("enabled: false", fail_disabled.stdout + fail_disabled.stderr)
 
+    def test_status_playbook_requires_the_intended_fuse_filesystem(self):
+        for name, body in {
+            "systemctl": "#!/bin/sh\nprintf 'ActiveState=active\\n'\n",
+            "findmnt": '#!/bin/sh\nprintf "%s\\n" "$FINDMNT_OUTPUT"\n',
+        }.items():
+            executable = self.fakebin / name
+            executable.write_text(body)
+            executable.chmod(0o755)
+
+        inventory = self.root / "status-inv.yml"
+        inventory.write_text(yaml.safe_dump({
+            "client_servers": {"hosts": {"fixture": {
+                "ansible_connection": "local",
+                "ansible_python_interpreter": sys.executable,
+                "dingo_clients": [{"fsname": "work", "mount_point": "/mnt/work", "base_dir": str(self.root)}],
+            }}},
+        }))
+        command = ["ansible-playbook", "-i", str(inventory), str(REPO / "playbooks/client_99_status.yml")]
+        env = dict(self._base_env(), PATH=str(self.fakebin) + os.pathsep + os.environ["PATH"])
+        for fstype, source, healthy in [
+            ("fuse.dingofs", "DingoFS:work", True),
+            ("fuse", "DingoFS:work", True),
+            ("ext4", "DingoFS:work", False),
+            ("fuse.dingofs", "DingoFS:other", False),
+        ]:
+            with self.subTest(fstype=fstype, source=source):
+                mount = json.dumps({"filesystems": [{"fstype": fstype, "source": source}]})
+                result = subprocess.run(command, cwd=REPO, env=dict(env, FINDMNT_OUTPUT=mount),
+                                        capture_output=True, text=True, timeout=30)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode == 0, healthy, output)
+                expected = ("/mnt/work is mounted from DingoFS:work." if healthy else
+                            "work at /mnt/work has service=active and mount=different.")
+                self.assertIn(expected, " ".join(output.split()))
+
     def test_deploy_role_skips_unmatched_host_and_rejects_disabled_or_typo_before_preflight(self):
         # Verify roles/dingo_client/tasks/main.yml selection runs before binaries/numactl/RDMA checks
         inv = {
